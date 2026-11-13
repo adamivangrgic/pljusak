@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 """
 Track 1h precipitation clusters from pljusak.com and detect which ones are
-heading toward a given target location.
+heading toward a given target location.  Also renders an ASCII map of the
+current state to stdout on every snapshot.
 
-Data source: the `var podaci = [...]` array embedded in the pljusak.com HTML.
-Column mapping (see prikazi() in the site's JS):
-  0=type  1=name  2=lat  3=lon  4=elev  5=zIndex  6=link
-  7=hw    8=sw    9=shelter  10=time  11=webcam
-  12=temp 13=temp_trend 14=pressure 15=pressure_trend 16=humidity
-  17=wind_dir 18=wind_ms
-  19=precip_month 20=precip_today 21=precip_24h 22=precip_1h
-  23=precip_6h 24=max_temp 25=min_temp 26=max_wind 27=uv
-  28=temp_24h_change 29=slug
-
-Run:  python pljusak_track.py --lat 45.8146 --lon 15.9722 --poll 180
+Run:  python pljusak_track.py --lat 45.8146 --lon 15.9722 --poll 180 --ascii
 """
 
 import argparse
@@ -23,7 +14,7 @@ import re
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -39,14 +30,19 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml",
 }
 
-DEFAULT_TARGET = (45.8146, 15.9722)      # Zagreb Grič
-DEFAULT_POLL = 180                        # seconds between snapshots
-MIN_PRECIP_MM = 0.1                       # station needs > this in 1h to count
-CLUSTER_EPS_KM = 20.0                     # stations this close get clustered
-CLUSTER_MIN_POINTS = 2                    # ignore single-station "clusters"
-MAX_TRACK_DISTANCE_KM = 40.0              # max centroid jump between snapshots
-THREAT_RADIUS_KM = 30.0                   # flag if closest-approach is within
-MIN_SPEED_KMH = 2.0                       # below this, treat as stationary
+DEFAULT_TARGET = (45.8146, 15.9722)
+DEFAULT_POLL = 180
+MIN_PRECIP_MM = 0.1
+CLUSTER_EPS_KM = 20.0
+CLUSTER_MIN_POINTS = 2
+MAX_TRACK_DISTANCE_KM = 40.0
+THREAT_RADIUS_KM = 30.0
+MIN_SPEED_KMH = 2.0
+
+# ASCII rendering
+ASCII_WIDTH = 72           # characters across
+ASCII_HEIGHT = 30          # characters tall
+ASCII_PAD_DEG = 1.5        # degrees of slack around the data bbox
 
 
 # ----------------------------------------------------------------------------
@@ -83,12 +79,12 @@ class Station:
 class Cluster:
     centroid_lat: float
     centroid_lon: float
-    total_precip: float         # sum(mm/h) across stations in cluster
-    max_precip: float           # strongest station in cluster
+    total_precip: float
+    max_precip: float
     n: int
-    station_names: list[str]
-    # Filled in by track_motion():
-    velocity_kmh: tuple = (0.0, 0.0)   # (vx_east, vy_north)
+    station_names: list[str] = field(default_factory=list)
+    members: list = field(default_factory=list)   # list[Station], for ASCII
+    velocity_kmh: tuple = (0.0, 0.0)
     speed_kmh: float = 0.0
 
 
@@ -97,7 +93,7 @@ class Approach:
     dist_km: float
     bearing_to_target: float
     bearing_of_motion: Optional[float]
-    approach_angle: Optional[float]   # 0 = straight at you, 90 = broadside
+    approach_angle: Optional[float]
     closest_approach_km: Optional[float]
     eta_min: Optional[float]
     approaching: bool
@@ -116,7 +112,6 @@ def fetch_podaci(timeout=30):
 
 
 def extract_wet_stations(rows, min_mm=MIN_PRECIP_MM):
-    """Return Station objects for every non-camera row with > min_mm in last 1h."""
     out = []
     for row in rows:
         if not row or row[0] == "kamera":
@@ -135,7 +130,7 @@ def extract_wet_stations(rows, min_mm=MIN_PRECIP_MM):
 
 
 # ----------------------------------------------------------------------------
-# Spatial clustering (union-find, O(n^2) which is fine for ~100 wet stations)
+# Clustering
 # ----------------------------------------------------------------------------
 def _cluster_by_distance(points, eps_km):
     n = len(points)
@@ -167,7 +162,6 @@ def _cluster_by_distance(points, eps_km):
 
 def build_clusters(stations, eps_km=CLUSTER_EPS_KM,
                    min_pts=CLUSTER_MIN_POINTS):
-    """Cluster wet stations; centroid weighted by precipitation intensity."""
     clusters = []
     for group in _cluster_by_distance(stations, eps_km):
         if len(group) < min_pts:
@@ -182,18 +176,16 @@ def build_clusters(stations, eps_km=CLUSTER_EPS_KM,
             total_precip=wsum,
             max_precip=max(s.precip_1h for s in group),
             n=len(group),
-            station_names=sorted(
-                (s.name for s in group),
-                key=lambda _: 0),  # keep insertion order
+            station_names=[s.name for s in group],
+            members=list(group),
         ))
     return clusters
 
 
 # ----------------------------------------------------------------------------
-# Motion tracking between two snapshots
+# Motion & approach
 # ----------------------------------------------------------------------------
 def track_motion(prev_clusters, new_clusters, dt_hours):
-    """Match each new cluster to the nearest previous centroid within range."""
     if not prev_clusters or not new_clusters or dt_hours <= 0:
         return
     used = set()
@@ -210,7 +202,6 @@ def track_motion(prev_clusters, new_clusters, dt_hours):
             continue
         used.add(best_i)
         pc = prev_clusters[best_i]
-        # Displacement in a local east/north km plane
         lat_mid = (nc.centroid_lat + pc.centroid_lat) / 2
         dy_km = (nc.centroid_lat - pc.centroid_lat) * 111.32
         dx_km = (nc.centroid_lon - pc.centroid_lon) * 111.32 * math.cos(math.radians(lat_mid))
@@ -220,33 +211,24 @@ def track_motion(prev_clusters, new_clusters, dt_hours):
         nc.speed_kmh = math.hypot(vx, vy)
 
 
-# ----------------------------------------------------------------------------
-# Approach prediction (closest-approach distance + ETA)
-# ----------------------------------------------------------------------------
 def assess_approach(cluster, target_lat, target_lon):
     coslat = math.cos(math.radians((target_lat + cluster.centroid_lat) / 2))
-    # Vector from target → cluster, in local east/north km
     dx_km = (cluster.centroid_lon - target_lon) * 111.32 * coslat
     dy_km = (cluster.centroid_lat - target_lat) * 111.32
     dist_km = math.hypot(dx_km, dy_km)
 
-    # Compass bearing from cluster toward target (0=N, 90=E)
     bearing_to_target = math.degrees(math.atan2(-dx_km, -dy_km)) % 360.0
 
     vx, vy = cluster.velocity_kmh
     speed = math.hypot(vx, vy)
-
     if speed < MIN_SPEED_KMH:
         return Approach(dist_km, bearing_to_target, None, None, None, None, False)
 
     bearing_of_motion = math.degrees(math.atan2(vx, vy)) % 360.0
-
-    # Unit vector from cluster → target
     ux, uy = -dx_km / dist_km, -dy_km / dist_km
     dot = vx * ux + vy * uy
     approach_angle = math.degrees(math.acos(max(-1.0, min(1.0, dot / speed))))
 
-    # Closest point of approach: t* = -(R·V)/|V|²
     t_star = -(dx_km * vx + dy_km * vy) / (speed * speed)
     approaching = t_star > 0
     if approaching:
@@ -263,16 +245,127 @@ def assess_approach(cluster, target_lat, target_lon):
 
 
 # ----------------------------------------------------------------------------
+# ASCII rendering
+# ----------------------------------------------------------------------------
+def render_ascii(stations, clusters, target_lat, target_lon,
+                 width=ASCII_WIDTH, height=ASCII_HEIGHT,
+                 pad_deg=ASCII_PAD_DEG):
+    """
+    Draw a lat/lon grid as text.  Longitude is compressed by cos(lat) so that
+    a degree of longitude and a degree of latitude occupy roughly the same
+    number of columns (i.e. the map isn't horizontally stretched).
+    """
+    # --- Bounding box (data + target + padding) -----------------------------
+    lats = [s.lat for s in stations] + [target_lat]
+    lons = [s.lon for s in stations] + [target_lon]
+    lat_min, lat_max = min(lats) - pad_deg, max(lats) + pad_deg
+    lon_min, lon_max = min(lons) - pad_deg, max(lons) + pad_deg
+
+    mid_lat = (lat_min + lat_max) / 2.0
+    cos_lat = max(0.05, math.cos(math.radians(mid_lat)))
+
+    # Compensate the horizontal cell count so 1° lat ≈ 1° lon × cos(lat) on screen.
+    width_adj = max(10, int(width * cos_lat))
+    height_adj = max(6, height)
+
+    # Guard against zero-span if there's only one station
+    lon_span = max(1e-6, lon_max - lon_min)
+    lat_span = max(1e-6, lat_max - lat_min)
+
+    def to_grid(lat, lon):
+        col = int(round((lon - lon_min) / lon_span * (width_adj - 1)))
+        row = int(round((lat_max - lat) / lat_span * (height_adj - 1)))
+        col = max(0, min(width_adj - 1, col))
+        row = max(0, min(height_adj - 1, row))
+        return row, col
+
+    # --- Canvas -------------------------------------------------------------
+    canvas = [[" "] * width_adj for _ in range(height_adj)]
+
+    # --- Wet stations: '·' small, '*' medium, '#' heavy --------------------
+    for s in stations:
+        r, c = to_grid(s.lat, s.lon)
+        if s.precip_1h >= 10:
+            ch = "#"
+        elif s.precip_1h >= 3:
+            ch = "*"
+        else:
+            ch = "·"
+        # don't overwrite a bigger marker with a smaller one
+        cur = canvas[r][c]
+        rank = {"·": 1, "*": 2, "#": 3, "T": 9, "C": 8, "→": 0, "↗": 0,
+                "↑": 0, "↖": 0, "←": 0, "↙": 0, "↓": 0, "↘": 0}
+        if rank.get(ch, 0) >= rank.get(cur, 0):
+            canvas[r][c] = ch
+
+    # --- Clusters: letter C + motion arrow ----------------------------------
+    # Draw arrows first, then the C on top so the C is never hidden.
+    for cl in clusters:
+        if cl.speed_kmh >= MIN_SPEED_KMH:
+            vx, vy = cl.velocity_kmh
+            bearing = math.degrees(math.atan2(vx, vy)) % 360.0
+            # Pick arrow glyph from compass bearing (8 directions)
+            if bearing < 22.5 or bearing >= 337.5:
+                arrow = "↑"
+            elif bearing < 67.5:
+                arrow = "↗"
+            elif bearing < 112.5:
+                arrow = "→"
+            elif bearing < 157.5:
+                arrow = "↘"
+            elif bearing < 202.5:
+                arrow = "↓"
+            elif bearing < 247.5:
+                arrow = "↙"
+            elif bearing < 292.5:
+                arrow = "←"
+            else:
+                arrow = "↖"
+            # Place the arrow ~2 cells in front of the centroid
+            r, c = to_grid(cl.centroid_lat, cl.centroid_lon)
+            ar = r - int(round(2 * math.cos(math.radians(bearing))))
+            ac = c + int(round(2 * math.sin(math.radians(bearing))))
+            if 0 <= ar < height_adj and 0 <= ac < width_adj:
+                if canvas[ar][ac] in (" ", "·", "*"):
+                    canvas[ar][ac] = arrow
+
+    for cl in clusters:
+        r, c = to_grid(cl.centroid_lat, cl.centroid_lon)
+        canvas[r][c] = "C"
+
+    # --- Target: T (always wins) --------------------------------------------
+    tr, tc = to_grid(target_lat, target_lon)
+    canvas[tr][tc] = "T"
+
+    # --- Frame + legend -----------------------------------------------------
+    top = "┌" + "─" * width_adj + "┐"
+    bot = "└" + "─" * width_adj + "┘"
+    lines = [top]
+    for row in canvas:
+        lines.append("│" + "".join(row) + "│")
+    lines.append(bot)
+
+    legend = (f"  T=target  C=cluster centroid  →=motion  "
+              f"·/*/#=station 1h precip (<3 / 3–10 / ≥10 mm)  "
+              f"bbox {lat_min:.2f}–{lat_max:.2f}N, "
+              f"{lon_min:.2f}–{lon_max:.2f}E")
+    lines.append(legend)
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
-def run(target_lat, target_lon, poll_s, iterations=None, dump_jsonl=None):
+def run(target_lat, target_lon, poll_s, iterations=None, dump_jsonl=None,
+        show_ascii=True):
     prev_clusters = []
     prev_time = None
     it = 0
     out_fh = open(dump_jsonl, "a") if dump_jsonl else None
     print(f"Target: ({target_lat:.4f}, {target_lon:.4f})")
     print(f"Poll: {poll_s}s | cluster eps: {CLUSTER_EPS_KM} km | "
-          f"threat radius: {THREAT_RADIUS_KM} km\n")
+          f"threat radius: {THREAT_RADIUS_KM} km")
+    print(f"ASCII: {'on' if show_ascii else 'off'}\n")
 
     try:
         while True:
@@ -290,6 +383,10 @@ def run(target_lat, target_lon, poll_s, iterations=None, dump_jsonl=None):
 
                 print(f"\n=== {now.strftime('%H:%M:%SZ')} | "
                       f"wet stations: {len(stations)} | clusters: {len(clusters)} ===")
+
+                if show_ascii and stations:
+                    print(render_ascii(stations, clusters,
+                                       target_lat, target_lon))
 
                 threats = []
                 for c in clusters:
@@ -357,16 +454,15 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--lat", type=float, default=DEFAULT_TARGET[0])
     p.add_argument("--lon", type=float, default=DEFAULT_TARGET[1])
-    p.add_argument("--poll", type=int, default=DEFAULT_POLL,
-                   help="seconds between snapshots (default 180)")
-    p.add_argument("--iterations", type=int, default=None,
-                   help="stop after N snapshots (default: run forever)")
-    p.add_argument("--dump-jsonl", type=str, default=None,
-                   help="append cluster snapshots to this JSONL file")
-    p.add_argument("--min-precip", type=float, default=None,
-                   help="override MIN_PRECIP_MM")
-    p.add_argument("--eps-km", type=float, default=None,
-                   help="override CLUSTER_EPS_KM")
+    p.add_argument("--poll", type=int, default=DEFAULT_POLL)
+    p.add_argument("--iterations", type=int, default=None)
+    p.add_argument("--dump-jsonl", type=str, default=None)
+    p.add_argument("--min-precip", type=float, default=None)
+    p.add_argument("--eps-km", type=float, default=None)
+    p.add_argument("--ascii", dest="ascii", action="store_true", default=True,
+                   help="render ASCII map (default: on)")
+    p.add_argument("--no-ascii", dest="ascii", action="store_false",
+                   help="disable ASCII map")
     args = p.parse_args()
 
     global MIN_PRECIP_MM, CLUSTER_EPS_KM
@@ -375,7 +471,8 @@ def main():
     if args.eps_km is not None:
         CLUSTER_EPS_KM = args.eps_km
 
-    run(args.lat, args.lon, args.poll, args.iterations, args.dump_jsonl)
+    run(args.lat, args.lon, args.poll, args.iterations, args.dump_jsonl,
+        args.ascii)
 
 
 if __name__ == "__main__":
