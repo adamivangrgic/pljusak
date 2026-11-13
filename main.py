@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Track 1h precipitation clusters from pljusak.com and detect which ones are
-heading toward a given target location.  Also renders an ASCII map of the
-current state to stdout on every snapshot.
+heading toward a given target location.  Renders an ASCII map with well-known
+reference cities so the geography is readable.
 
-Run:  python pljusak_track.py --lat 45.8146 --lon 15.9722 --poll 180 --ascii
+Run:  python pljusak_track.py --lat 45.8146 --lon 15.9722 --poll 180
 """
 
 import argparse
@@ -40,9 +40,28 @@ THREAT_RADIUS_KM = 30.0
 MIN_SPEED_KMH = 2.0
 
 # ASCII rendering
-ASCII_WIDTH = 72           # characters across
-ASCII_HEIGHT = 30          # characters tall
-ASCII_PAD_DEG = 1.5        # degrees of slack around the data bbox
+ASCII_WIDTH = 84
+ASCII_HEIGHT = 32
+ASCII_PAD_DEG = 1.2
+
+# Reference cities drawn on the map.  Keep labels short (2–3 chars) so
+# they fit in the map without clobbering each other.
+# (label, lat, lon)
+CITIES = [
+    ("zg", 45.8146, 15.9722),   # Zagreb
+    ("ri", 45.3271, 14.4422),   # Rijeka
+    ("st", 43.5081, 16.4402),   # Split
+    ("os", 45.5550, 18.6955),   # Osijek
+    ("zd", 44.1194, 15.2314),   # Zadar
+    ("db", 42.6507, 18.0944),   # Dubrovnik
+    ("pu", 44.8666, 13.8496),   # Pula
+    ("vk", 45.2551, 19.1122),   # Vukovar
+    ("ka", 45.4929, 15.5551),   # Karlovac
+    ("va", 46.3057, 16.3366),   # Varaždin
+    ("bk", 45.3271, 14.4422),   # (placeholder - remove if not needed)
+    ("lj", 46.0569, 14.5058),   # Ljubljana (SLO)
+    ("tb", 43.8633, 18.4131),   # Sarajevo (BiH)
+]
 
 
 # ----------------------------------------------------------------------------
@@ -83,7 +102,7 @@ class Cluster:
     max_precip: float
     n: int
     station_names: list[str] = field(default_factory=list)
-    members: list = field(default_factory=list)   # list[Station], for ASCII
+    members: list = field(default_factory=list)
     velocity_kmh: tuple = (0.0, 0.0)
     speed_kmh: float = 0.0
 
@@ -249,40 +268,42 @@ def assess_approach(cluster, target_lat, target_lon):
 # ----------------------------------------------------------------------------
 def render_ascii(stations, clusters, target_lat, target_lon,
                  width=ASCII_WIDTH, height=ASCII_HEIGHT,
-                 pad_deg=ASCII_PAD_DEG):
+                 pad_deg=ASCII_PAD_DEG, show_cities=True):
     """
-    Draw a lat/lon grid as text.  Longitude is compressed by cos(lat) so that
-    a degree of longitude and a degree of latitude occupy roughly the same
-    number of columns (i.e. the map isn't horizontally stretched).
+    Draw a lat/lon grid as text with reference cities.
+
+    Marker priority (higher wins):
+        T  target
+        C  cluster centroid
+        lowercase city label letters
+        motion arrows
+        · * #  station markers (by precip intensity)
     """
-    # --- Bounding box (data + target + padding) -----------------------------
+    # --- Bounding box -------------------------------------------------------
     lats = [s.lat for s in stations] + [target_lat]
     lons = [s.lon for s in stations] + [target_lon]
+    if show_cities:
+        lats += [c[1] for c in CITIES]
+        lons += [c[2] for c in CITIES]
     lat_min, lat_max = min(lats) - pad_deg, max(lats) + pad_deg
     lon_min, lon_max = min(lons) - pad_deg, max(lons) + pad_deg
 
     mid_lat = (lat_min + lat_max) / 2.0
     cos_lat = max(0.05, math.cos(math.radians(mid_lat)))
+    width_adj = max(20, int(width * cos_lat))
+    height_adj = max(8, height)
 
-    # Compensate the horizontal cell count so 1° lat ≈ 1° lon × cos(lat) on screen.
-    width_adj = max(10, int(width * cos_lat))
-    height_adj = max(6, height)
-
-    # Guard against zero-span if there's only one station
     lon_span = max(1e-6, lon_max - lon_min)
     lat_span = max(1e-6, lat_max - lat_min)
 
     def to_grid(lat, lon):
         col = int(round((lon - lon_min) / lon_span * (width_adj - 1)))
         row = int(round((lat_max - lat) / lat_span * (height_adj - 1)))
-        col = max(0, min(width_adj - 1, col))
-        row = max(0, min(height_adj - 1, row))
-        return row, col
+        return max(0, min(height_adj - 1, row)), max(0, min(width_adj - 1, col))
 
-    # --- Canvas -------------------------------------------------------------
     canvas = [[" "] * width_adj for _ in range(height_adj)]
 
-    # --- Wet stations: '·' small, '*' medium, '#' heavy --------------------
+    # --- Pass 1: station dots (lowest priority of everything) ---------------
     for s in stations:
         r, c = to_grid(s.lat, s.lon)
         if s.precip_1h >= 10:
@@ -291,53 +312,75 @@ def render_ascii(stations, clusters, target_lat, target_lon,
             ch = "*"
         else:
             ch = "·"
-        # don't overwrite a bigger marker with a smaller one
-        cur = canvas[r][c]
-        rank = {"·": 1, "*": 2, "#": 3, "T": 9, "C": 8, "→": 0, "↗": 0,
-                "↑": 0, "↖": 0, "←": 0, "↙": 0, "↓": 0, "↘": 0}
-        if rank.get(ch, 0) >= rank.get(cur, 0):
+        if canvas[r][c] == " ":
             canvas[r][c] = ch
 
-    # --- Clusters: letter C + motion arrow ----------------------------------
-    # Draw arrows first, then the C on top so the C is never hidden.
+    # --- Pass 2: motion arrows ---------------------------------------------
     for cl in clusters:
-        if cl.speed_kmh >= MIN_SPEED_KMH:
-            vx, vy = cl.velocity_kmh
-            bearing = math.degrees(math.atan2(vx, vy)) % 360.0
-            # Pick arrow glyph from compass bearing (8 directions)
-            if bearing < 22.5 or bearing >= 337.5:
-                arrow = "↑"
-            elif bearing < 67.5:
-                arrow = "↗"
-            elif bearing < 112.5:
-                arrow = "→"
-            elif bearing < 157.5:
-                arrow = "↘"
-            elif bearing < 202.5:
-                arrow = "↓"
-            elif bearing < 247.5:
-                arrow = "↙"
-            elif bearing < 292.5:
-                arrow = "←"
-            else:
-                arrow = "↖"
-            # Place the arrow ~2 cells in front of the centroid
-            r, c = to_grid(cl.centroid_lat, cl.centroid_lon)
-            ar = r - int(round(2 * math.cos(math.radians(bearing))))
-            ac = c + int(round(2 * math.sin(math.radians(bearing))))
-            if 0 <= ar < height_adj and 0 <= ac < width_adj:
-                if canvas[ar][ac] in (" ", "·", "*"):
-                    canvas[ar][ac] = arrow
+        if cl.speed_kmh < MIN_SPEED_KMH:
+            continue
+        vx, vy = cl.velocity_kmh
+        bearing = math.degrees(math.atan2(vx, vy)) % 360.0
+        if bearing < 22.5 or bearing >= 337.5:
+            arrow = "↑"
+        elif bearing < 67.5:
+            arrow = "↗"
+        elif bearing < 112.5:
+            arrow = "→"
+        elif bearing < 157.5:
+            arrow = "↘"
+        elif bearing < 202.5:
+            arrow = "↓"
+        elif bearing < 247.5:
+            arrow = "↙"
+        elif bearing < 292.5:
+            arrow = "←"
+        else:
+            arrow = "↖"
+        r, c = to_grid(cl.centroid_lat, cl.centroid_lon)
+        ar = r - int(round(2 * math.cos(math.radians(bearing))))
+        ac = c + int(round(2 * math.sin(math.radians(bearing))))
+        if 0 <= ar < height_adj and 0 <= ac < width_adj:
+            if canvas[ar][ac] in (" ", "·", "*", "#"):
+                canvas[ar][ac] = arrow
 
+    # --- Pass 3: city labels -----------------------------------------------
+    # Draw each city as its 2-char label.  Reserve a 1-cell halo so
+    # subsequent markers (C, T) can still overwrite, but stations can't
+    # bleed into the label.
+    if show_cities:
+        reserved = set()
+        for label, clat, clon in CITIES:
+            r, c = to_grid(clat, clon)
+            for i, ch in enumerate(label):
+                cc = c + i
+                if 0 <= cc < width_adj and canvas[r][cc] not in ("T", "C"):
+                    canvas[r][cc] = ch
+                reserved.add((r, cc))
+            # halo around label so station dots don't crowd it
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1, len(label)):
+                    rr, cc = r + dr, c + dc
+                    if 0 <= rr < height_adj and 0 <= cc < width_adj:
+                        reserved.add((rr, cc))
+        # Knock out any station dots sitting directly on the halo so the
+        # label reads cleanly.  (We re-draw stations first, so this is a
+        # targeted cleanup.)
+        for (rr, cc) in reserved:
+            if canvas[rr][cc] in ("·", "*", "#"):
+                canvas[rr][cc] = " "
+
+    # --- Pass 4: cluster centroids -----------------------------------------
     for cl in clusters:
         r, c = to_grid(cl.centroid_lat, cl.centroid_lon)
         canvas[r][c] = "C"
 
-    # --- Target: T (always wins) --------------------------------------------
+    # --- Pass 5: target ----------------------------------------------------
     tr, tc = to_grid(target_lat, target_lon)
+    # Wipe any label letters that overlap the target cell so T is unambiguous
     canvas[tr][tc] = "T"
 
-    # --- Frame + legend -----------------------------------------------------
+    # --- Frame -------------------------------------------------------------
     top = "┌" + "─" * width_adj + "┐"
     bot = "└" + "─" * width_adj + "┘"
     lines = [top]
@@ -345,11 +388,15 @@ def render_ascii(stations, clusters, target_lat, target_lon,
         lines.append("│" + "".join(row) + "│")
     lines.append(bot)
 
-    legend = (f"  T=target  C=cluster centroid  →=motion  "
-              f"·/*/#=station 1h precip (<3 / 3–10 / ≥10 mm)  "
-              f"bbox {lat_min:.2f}–{lat_max:.2f}N, "
-              f"{lon_min:.2f}–{lon_max:.2f}E")
+    legend = (f"  T=target  C=cluster  →=motion  "
+              f"·/*/#=1h precip (<3/3–10/≥10 mm)  "
+              f"lowercase=reference city  "
+              f"bbox {lat_min:.2f}–{lat_max:.2f}N, {lon_min:.2f}–{lon_max:.2f}E")
     lines.append(legend)
+    if show_cities:
+        city_line = "  cities: " + "  ".join(f"{lbl}={clat:.2f},{clon:.2f}"
+                                             for lbl, clat, clon in CITIES[:8])
+        lines.append(city_line)
     return "\n".join(lines)
 
 
@@ -357,7 +404,7 @@ def render_ascii(stations, clusters, target_lat, target_lon,
 # Main loop
 # ----------------------------------------------------------------------------
 def run(target_lat, target_lon, poll_s, iterations=None, dump_jsonl=None,
-        show_ascii=True):
+        show_ascii=True, show_cities=True):
     prev_clusters = []
     prev_time = None
     it = 0
@@ -365,7 +412,8 @@ def run(target_lat, target_lon, poll_s, iterations=None, dump_jsonl=None,
     print(f"Target: ({target_lat:.4f}, {target_lon:.4f})")
     print(f"Poll: {poll_s}s | cluster eps: {CLUSTER_EPS_KM} km | "
           f"threat radius: {THREAT_RADIUS_KM} km")
-    print(f"ASCII: {'on' if show_ascii else 'off'}\n")
+    print(f"ASCII: {'on' if show_ascii else 'off'} | "
+          f"cities: {'on' if show_cities else 'off'}\n")
 
     try:
         while True:
@@ -386,7 +434,8 @@ def run(target_lat, target_lon, poll_s, iterations=None, dump_jsonl=None,
 
                 if show_ascii and stations:
                     print(render_ascii(stations, clusters,
-                                       target_lat, target_lon))
+                                       target_lat, target_lon,
+                                       show_cities=show_cities))
 
                 threats = []
                 for c in clusters:
@@ -459,10 +508,10 @@ def main():
     p.add_argument("--dump-jsonl", type=str, default=None)
     p.add_argument("--min-precip", type=float, default=None)
     p.add_argument("--eps-km", type=float, default=None)
-    p.add_argument("--ascii", dest="ascii", action="store_true", default=True,
-                   help="render ASCII map (default: on)")
-    p.add_argument("--no-ascii", dest="ascii", action="store_false",
-                   help="disable ASCII map")
+    p.add_argument("--ascii", dest="ascii", action="store_true", default=True)
+    p.add_argument("--no-ascii", dest="ascii", action="store_false")
+    p.add_argument("--cities", dest="cities", action="store_true", default=True)
+    p.add_argument("--no-cities", dest="cities", action="store_false")
     args = p.parse_args()
 
     global MIN_PRECIP_MM, CLUSTER_EPS_KM
@@ -472,7 +521,7 @@ def main():
         CLUSTER_EPS_KM = args.eps_km
 
     run(args.lat, args.lon, args.poll, args.iterations, args.dump_jsonl,
-        args.ascii)
+        args.ascii, args.cities)
 
 
 if __name__ == "__main__":
