@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
 Track 1h precipitation clusters from pljusak.com and detect which ones are
-heading toward a given target location.  Renders an ASCII map restricted to
-a configurable radius (default 100 km) around the target.
+heading toward a given target location.  The target can be specified by
+coordinates, city name/label, or by substring of a station name.
 
-Run:  python pljusak_track.py --lat 45.8146 --lon 15.9722 --poll 180 --radius 100
+Run examples:
+  python pljusak_track.py --location zg
+  python pljusak_track.py --location "Split"
+  python pljusak_track.py --location Puntijarka
+  python pljusak_track.py --lat 45.8146 --lon 15.9722
 """
 
 import argparse
+import difflib
 import json
 import math
 import re
@@ -39,26 +44,33 @@ MAX_TRACK_DISTANCE_KM = 40.0
 THREAT_RADIUS_KM = 30.0
 MIN_SPEED_KMH = 2.0
 
-# ASCII rendering
 ASCII_WIDTH = 84
 ASCII_HEIGHT = 32
-MAP_RADIUS_KM = 100.0      # map extent: this many km around the target
+MAP_RADIUS_KM = 100.0
 
-# Reference cities drawn on the map.  Only those inside the map radius are
-# actually rendered, so the list can be broad.
+# Reference cities: (label, name, lat, lon)
 CITIES = [
-    ("zg", 45.8146, 15.9722),   # Zagreb
-    ("ri", 45.3271, 14.4422),   # Rijeka
-    ("st", 43.5081, 16.4402),   # Split
-    ("os", 45.5550, 18.6955),   # Osijek
-    ("zd", 44.1194, 15.2314),   # Zadar
-    ("db", 42.6507, 18.0944),   # Dubrovnik
-    ("pu", 44.8666, 13.8496),   # Pula
-    ("vk", 45.2551, 19.1122),   # Vukovar
-    ("ka", 45.4929, 15.5551),   # Karlovac
-    ("va", 46.3057, 16.3366),   # Varaždin
-    ("lj", 46.0569, 14.5058),   # Ljubljana (SLO)
-    ("tb", 43.8633, 18.4131),   # Sarajevo (BiH)
+    ("zg", "Zagreb",     45.8146, 15.9722),
+    ("ri", "Rijeka",     45.3271, 14.4422),
+    ("st", "Split",      43.5081, 16.4402),
+    ("os", "Osijek",     45.5550, 18.6955),
+    ("zd", "Zadar",      44.1194, 15.2314),
+    ("db", "Dubrovnik",  42.6507, 18.0944),
+    ("pu", "Pula",       44.8666, 13.8496),
+    ("vk", "Vukovar",    45.2551, 19.1122),
+    ("ka", "Karlovac",   45.4929, 15.5551),
+    ("va", "Varaždin",   46.3057, 16.3366),
+    ("lj", "Ljubljana",  46.0569, 14.5058),
+    ("tb", "Sarajevo",   43.8633, 18.4131),
+    ("sk", "Sisak",      45.4667, 16.3789),
+    ("vk2", "Vinkovci",  45.2886, 18.8042),
+    ("kt", "Kutina",     45.4772, 16.7783),
+    ("bj", "Bjelovar",   45.8986, 16.8422),
+    ("po", "Požega",     45.3403, 17.6853),
+    ("sb", "Slavonski Brod", 45.1603, 18.0156),
+    ("mk", "Makarska",   43.2969, 17.0178),
+    ("šb", "Šibenik",    43.7350, 15.8956),
+    ("ri2","Rovinj",     45.0811, 13.6387),
 ]
 
 
@@ -81,11 +93,79 @@ def bearing_label(deg):
 
 
 def radius_to_bbox(lat, lon, radius_km):
-    """Approximate lat/lon bounding box for a circle of radius_km around (lat, lon)."""
     dlat = radius_km / 111.32
     coslat = max(0.01, math.cos(math.radians(lat)))
     dlon = radius_km / (111.32 * coslat)
     return lat - dlat, lat + dlat, lon - dlon, lon + dlon
+
+
+# ----------------------------------------------------------------------------
+# Location resolution
+# ----------------------------------------------------------------------------
+def resolve_city(query: str):
+    """Match a city label (zg) or name (Zagreb) — case insensitive, fuzzy."""
+    q = query.strip().lower()
+    for label, name, lat, lon in CITIES:
+        if q == label.lower() or q == name.lower():
+            return name, lat, lon
+    # fuzzy on both label and name
+    by_label = {lbl.lower(): (nm, la, lo) for lbl, nm, la, lo in CITIES}
+    by_name = {nm.lower(): (nm, la, lo) for lbl, nm, la, lo in CITIES}
+    for source in (by_label, by_name):
+        m = difflib.get_close_matches(q, list(source.keys()), n=1, cutoff=0.6)
+        if m:
+            return source[m[0]]
+    return None
+
+
+def resolve_station(query: str, rows):
+    """Find stations whose name contains query (case insensitive, accent-tolerant)."""
+    import unicodedata
+
+    def norm(s):
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        return s.lower().strip()
+
+    q = norm(query)
+    if not q:
+        return None
+    exact = []
+    partial = []
+    for row in rows:
+        if not row or row[0] == "kamera":
+            continue
+        name = row[1] if len(row) > 1 else ""
+        try:
+            lat = float(row[2]); lon = float(row[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if norm(name) == q:
+            exact.append((name, lat, lon))
+        elif q in norm(name):
+            partial.append((name, lat, lon))
+    return (exact or partial or None)
+
+
+def resolve_location(args, rows=None):
+    """Turn args into (name, lat, lon).  Priority: --location > --lat/--lon > default."""
+    if args.location:
+        city = resolve_city(args.location)
+        if city:
+            return city
+        # fall back to station lookup if we have data
+        if rows is not None:
+            matches = resolve_station(args.location, rows)
+            if matches:
+                if len(matches) > 1:
+                    print(f"Multiple stations match '{args.location}': "
+                          f"{[m[0] for m in matches[:5]]}... using first",
+                          file=sys.stderr)
+                return matches[0]
+        print(f"ERROR: could not resolve location '{args.location}'",
+              file=sys.stderr)
+        sys.exit(2)
+    return ("custom", args.lat, args.lon)
 
 
 # ----------------------------------------------------------------------------
@@ -142,9 +222,7 @@ def extract_wet_stations(rows, min_mm=MIN_PRECIP_MM):
         if not row or row[0] == "kamera":
             continue
         try:
-            lat = float(row[2])
-            lon = float(row[3])
-            v = float(row[22])
+            lat = float(row[2]); lon = float(row[3]); v = float(row[22])
         except (TypeError, ValueError, IndexError):
             continue
         if v <= min_mm:
@@ -230,10 +308,8 @@ def track_motion(prev_clusters, new_clusters, dt_hours):
         lat_mid = (nc.centroid_lat + pc.centroid_lat) / 2
         dy_km = (nc.centroid_lat - pc.centroid_lat) * 111.32
         dx_km = (nc.centroid_lon - pc.centroid_lon) * 111.32 * math.cos(math.radians(lat_mid))
-        vx = dx_km / dt_hours
-        vy = dy_km / dt_hours
-        nc.velocity_kmh = (vx, vy)
-        nc.speed_kmh = math.hypot(vx, vy)
+        nc.velocity_kmh = (dx_km / dt_hours, dy_km / dt_hours)
+        nc.speed_kmh = math.hypot(*nc.velocity_kmh)
 
 
 def assess_approach(cluster, target_lat, target_lon):
@@ -243,7 +319,6 @@ def assess_approach(cluster, target_lat, target_lon):
     dist_km = math.hypot(dx_km, dy_km)
 
     bearing_to_target = math.degrees(math.atan2(-dx_km, -dy_km)) % 360.0
-
     vx, vy = cluster.velocity_kmh
     speed = math.hypot(vx, vy)
     if speed < MIN_SPEED_KMH:
@@ -264,32 +339,22 @@ def assess_approach(cluster, target_lat, target_lon):
     else:
         closest_km = dist_km
         eta_min = None
-
     return Approach(dist_km, bearing_to_target, bearing_of_motion,
                     approach_angle, closest_km, eta_min, approaching)
 
 
 # ----------------------------------------------------------------------------
-# ASCII rendering
+# ASCII rendering (unchanged from previous version except CITIES shape)
 # ----------------------------------------------------------------------------
 def render_ascii(stations, clusters, target_lat, target_lon,
                  radius_km=MAP_RADIUS_KM,
                  width=ASCII_WIDTH, height=ASCII_HEIGHT,
                  show_cities=True):
-    """
-    Draw a lat/lon grid as text, clipped to a square bounding box of
-    `radius_km` around (target_lat, target_lon).
-
-    Station dots, motion arrows and city labels outside the box are simply
-    not drawn; the bbox itself does not expand to fit outliers.
-    """
     lat_min, lat_max, lon_min, lon_max = radius_to_bbox(target_lat, target_lon, radius_km)
-
     mid_lat = (lat_min + lat_max) / 2.0
     cos_lat = max(0.05, math.cos(math.radians(mid_lat)))
     width_adj = max(20, int(width * cos_lat))
     height_adj = max(8, height)
-
     lon_span = max(1e-6, lon_max - lon_min)
     lat_span = max(1e-6, lat_max - lat_min)
 
@@ -303,54 +368,31 @@ def render_ascii(stations, clusters, target_lat, target_lon,
 
     canvas = [[" "] * width_adj for _ in range(height_adj)]
 
-    # --- Pass 1: station dots ----------------------------------------------
-    stations_in_box = [s for s in stations if in_box(s.lat, s.lon)]
-    for s in stations_in_box:
+    for s in stations:
+        if not in_box(s.lat, s.lon):
+            continue
         r, c = to_grid(s.lat, s.lon)
-        if s.precip_1h >= 10:
-            ch = "#"
-        elif s.precip_1h >= 3:
-            ch = "*"
-        else:
-            ch = "·"
+        ch = "#" if s.precip_1h >= 10 else "*" if s.precip_1h >= 3 else "·"
         if canvas[r][c] == " ":
             canvas[r][c] = ch
 
-    # --- Pass 2: motion arrows ---------------------------------------------
     for cl in clusters:
-        if cl.speed_kmh < MIN_SPEED_KMH:
+        if cl.speed_kmh < MIN_SPEED_KMH or not in_box(cl.centroid_lat, cl.centroid_lon):
             continue
-        if not in_box(cl.centroid_lat, cl.centroid_lon):
-            continue
-        vx, vy = cl.velocity_kmh
-        bearing = math.degrees(math.atan2(vx, vy)) % 360.0
-        if bearing < 22.5 or bearing >= 337.5:
-            arrow = "↑"
-        elif bearing < 67.5:
-            arrow = "↗"
-        elif bearing < 112.5:
-            arrow = "→"
-        elif bearing < 157.5:
-            arrow = "↘"
-        elif bearing < 202.5:
-            arrow = "↓"
-        elif bearing < 247.5:
-            arrow = "↙"
-        elif bearing < 292.5:
-            arrow = "←"
-        else:
-            arrow = "↖"
+        bearing = math.degrees(math.atan2(cl.velocity_kmh[0], cl.velocity_kmh[1])) % 360
+        arrow = ("↑" if bearing < 22.5 or bearing >= 337.5 else
+                 "↗" if bearing < 67.5 else "→" if bearing < 112.5 else
+                 "↘" if bearing < 157.5 else "↓" if bearing < 202.5 else
+                 "↙" if bearing < 247.5 else "←" if bearing < 292.5 else "↖")
         r, c = to_grid(cl.centroid_lat, cl.centroid_lon)
         ar = r - int(round(2 * math.cos(math.radians(bearing))))
         ac = c + int(round(2 * math.sin(math.radians(bearing))))
-        if 0 <= ar < height_adj and 0 <= ac < width_adj:
-            if canvas[ar][ac] in (" ", "·", "*", "#"):
-                canvas[ar][ac] = arrow
+        if 0 <= ar < height_adj and 0 <= ac < width_adj and canvas[ar][ac] in (" ", "·", "*", "#"):
+            canvas[ar][ac] = arrow
 
-    # --- Pass 3: city labels (only those inside the bbox) ------------------
     if show_cities:
         reserved = set()
-        for label, clat, clon in CITIES:
+        for label, name, clat, clon in CITIES:
             if not in_box(clat, clon):
                 continue
             r, c = to_grid(clat, clon)
@@ -368,42 +410,38 @@ def render_ascii(stations, clusters, target_lat, target_lon,
             if canvas[rr][cc] in ("·", "*", "#"):
                 canvas[rr][cc] = " "
 
-    # --- Pass 4: cluster centroids -----------------------------------------
     for cl in clusters:
         if not in_box(cl.centroid_lat, cl.centroid_lon):
             continue
         r, c = to_grid(cl.centroid_lat, cl.centroid_lon)
         canvas[r][c] = "C"
 
-    # --- Pass 5: target ----------------------------------------------------
     tr, tc = to_grid(target_lat, target_lon)
     canvas[tr][tc] = "T"
 
-    # --- Frame -------------------------------------------------------------
     top = "┌" + "─" * width_adj + "┐"
     bot = "└" + "─" * width_adj + "┘"
     lines = [top]
     for row in canvas:
         lines.append("│" + "".join(row) + "│")
     lines.append(bot)
-
-    legend = (f"  T=target  C=cluster  →=motion  "
-              f"·/*/#=1h precip (<3/3–10/≥10 mm)  lowercase=city  "
-              f"±{radius_km:.0f}km around ({target_lat:.2f},{target_lon:.2f})")
-    lines.append(legend)
+    lines.append(f"  T=target  C=cluster  →=motion  ·/*/#=1h precip  "
+                 f"lowercase=city  ±{radius_km:.0f}km")
     return "\n".join(lines)
 
 
 # ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
-def run(target_lat, target_lon, poll_s, iterations=None, dump_jsonl=None,
-        show_ascii=True, show_cities=True, radius_km=MAP_RADIUS_KM):
+def run(target_name, target_lat, target_lon, poll_s, iterations=None,
+        dump_jsonl=None, show_ascii=True, show_cities=True,
+        radius_km=MAP_RADIUS_KM):
     prev_clusters = []
     prev_time = None
     it = 0
     out_fh = open(dump_jsonl, "a") if dump_jsonl else None
-    print(f"Target: ({target_lat:.4f}, {target_lon:.4f})  radius: {radius_km:.0f} km")
+    print(f"Target: {target_name} ({target_lat:.4f}, {target_lon:.4f})  "
+          f"radius: {radius_km:.0f} km")
     print(f"Poll: {poll_s}s | cluster eps: {CLUSTER_EPS_KM} km | "
           f"threat radius: {THREAT_RADIUS_KM} km")
     print(f"ASCII: {'on' if show_ascii else 'off'} | "
@@ -496,6 +534,8 @@ def run(target_lat, target_lon, poll_s, iterations=None, dump_jsonl=None,
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--location", type=str, default=None,
+                   help="city label (zg), city name (Zagreb), or station name substring")
     p.add_argument("--lat", type=float, default=DEFAULT_TARGET[0])
     p.add_argument("--lon", type=float, default=DEFAULT_TARGET[1])
     p.add_argument("--poll", type=int, default=DEFAULT_POLL)
@@ -503,8 +543,7 @@ def main():
     p.add_argument("--dump-jsonl", type=str, default=None)
     p.add_argument("--min-precip", type=float, default=None)
     p.add_argument("--eps-km", type=float, default=None)
-    p.add_argument("--radius", type=float, default=MAP_RADIUS_KM,
-                   help="map radius around target in km (default 100)")
+    p.add_argument("--radius", type=float, default=MAP_RADIUS_KM)
     p.add_argument("--ascii", dest="ascii", action="store_true", default=True)
     p.add_argument("--no-ascii", dest="ascii", action="store_false")
     p.add_argument("--cities", dest="cities", action="store_true", default=True)
@@ -517,8 +556,37 @@ def main():
     if args.eps_km is not None:
         CLUSTER_EPS_KM = args.eps_km
 
-    run(args.lat, args.lon, args.poll, args.iterations, args.dump_jsonl,
-        args.ascii, args.cities, args.radius)
+    # Resolve location.  Station lookup needs one fetch; cache it for the
+    # first iteration so we don't pay for two GETs at startup.
+    target_name, target_lat, target_lon = (None, args.lat, args.lon)
+    pre_rows = None
+    if args.location:
+        city = resolve_city(args.location)
+        if city:
+            target_name, target_lat, target_lon = city
+        else:
+            try:
+                pre_rows = fetch_podaci()
+            except Exception as e:
+                print(f"ERROR: could not fetch podaci to resolve station: {e}",
+                      file=sys.stderr)
+                sys.exit(2)
+            matches = resolve_station(args.location, pre_rows)
+            if not matches:
+                print(f"ERROR: no city or station matches '{args.location}'",
+                      file=sys.stderr)
+                sys.exit(2)
+            if len(matches) > 1:
+                print(f"Multiple stations match '{args.location}': "
+                      f"{[m[0] for m in matches[:5]]}; using '{matches[0][0]}'",
+                      file=sys.stderr)
+            target_name, target_lat, target_lon = matches[0]
+
+    if not target_name:
+        target_name = f"{target_lat:.4f},{target_lon:.4f}"
+
+    run(target_name, target_lat, target_lon, args.poll, args.iterations,
+        args.dump_jsonl, args.ascii, args.cities, args.radius)
 
 
 if __name__ == "__main__":
